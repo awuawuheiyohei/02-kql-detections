@@ -1,0 +1,395 @@
+// =============================================================================
+// KQL 检测规则 01：异常登录模式检测
+// =============================================================================
+// 规则名称    : Suspicious Sign-In Pattern - Impossible Travel
+// 规则 ID      : KQL-001
+// 战术        : TA0006 Credential Access / TA0043 Reconnaissance
+// 检测逻辑    : 同一账号在短时间内从相距过远的地理位置登录（不可能旅行）
+// 数据源      : SigninLogs (Entra ID / Azure AD)
+// 误报场景    : VPN 出口 IP 变化、跨国出差、代理服务器
+// 调优建议    : 1) 建立 VPN 出口 IP 白名单（ASN 级别）
+//              2) 排除已知的企业代理池
+//              3) 对高权限账号（PIM eligible）提升告警等级
+// -----------------------------------------------------------------------------
+
+let TimeWindow = 4h;                                          // 检测窗口
+let ImpossibleTravelKm = 800;                                  // 4 小时内移动超过 800km 视为可疑
+let WhitelistedAsn = dynamic(["AS0_PLACEHOLDER"]);              // 企业 VPN / 代理出口 ASN
+
+// 1) 取登录事件并计算地理信息
+SigninLogs
+| where TimeGenerated > ago(TimeWindow)
+| extend
+    CountryOrRegion = tostring(LocationDetails.countryOrRegion),
+    City = tostring(LocationDetails.city),
+    Latitude = toreal(LocationDetails.geoCoordinates.latitude),
+    Longitude = toreal(LocationDetails.geoCoordinates.longitude),
+    IsSuccessful = ResultType == 0,
+    // 高权限账号标记
+    AccountSensitivity = case(
+        tostring(UserPrincipalName) has_anyprefix (dynamic(["admin","svc_","ga_"])) or
+        AppDisplayName in~ ("Microsoft Exchange Online", "Azure Active Directory"),
+        "High", "Standard"
+    )
+| where isnotempty(Latitude) and isnotempty(Longitude)
+| summarize
+    // 同账号按时间排序，计算相邻两次登录的距离
+    FirstLoginTime = min(TimeGenerated),
+    LastLoginTime = max(TimeGenerated),
+    LoginCount = count(),
+    Locations = make_set(strcat(CountryOrRegion, "/", City), 10),
+    LocationCount = dcount(strcat(CountryOrRegion, "/", City)),
+    SuccessCount = countif(IsSuccessful),
+    FailureCount = countif(not(IsSuccessful)),
+    MaxSensitivity = take_any(MaxSensitivity),
+    AppList = make_set(AppDisplayName, 10)
+    by UserPrincipalName, UserDisplayName, AccountSensitivity
+| where LocationCount >= 3                                    // 同一账号 3+ 个不同城市
+| extend
+    SuspiciousActivity = case(
+        LocationCount >= 5 and FailureCount > 0, "High - Multiple Locations + Failures",
+        LocationCount >= 5, "Medium - Multiple Locations",
+        "Low - Multiple Locations"
+    ),
+    RiskScore = case(
+        AccountSensitivity == "High" and LocationCount >= 5, 90,
+        AccountSensitivity == "High", 75,
+        LocationCount >= 5, 60,
+        40
+    )
+| project
+    Timestamp = LastLoginTime,
+    UserPrincipalName,
+    UserDisplayName,
+    AccountSensitivity,
+    SuspiciousActivity,
+    RiskScore,
+    LocationCount,
+    Locations,
+    LoginCount,
+    SuccessCount,
+    FailureCount,
+    AppsUsed = tostring(AppList),
+    FirstSeen = FirstLoginTime
+| where RiskScore >= 60
+| order by Timestamp desc
+```
+
+---
+
+// =============================================================================
+// KQL 检测规则 02：特权账户异常操作
+// =============================================================================
+// 规则名称    : Privileged Account - Anomalous Role Assignment
+// 规则 ID      : KQL-002
+// 战术        : TA0005 Privilege Escalation
+// 检测逻辑    : 特权账户被授予新角色，且该角色在 30 天内未使用过
+// 数据源      : AuditLogs (RoleManagement / RoleEligibility)
+// 误报场景    : 新员工入职、工单系统自动授权、轮岗
+// 调优建议    : 建立"角色使用基线"，只对偏离基线的授权告警
+// -----------------------------------------------------------------------------
+
+let LookbackDays = 30d;
+let SuspiciousRoles = dynamic(["Global Administrator", "Company Administrator",
+    "Security Administrator", "Exchange Administrator", "Privileged Role Administrator"]);
+
+// 1) 找出"冷门"角色（30 天内从未被使用过的）
+let ColdRoles = Materialize(
+    AuditLogs
+    | where TimeGenerated > ago(LookbackDays)
+    | where OperationNameValue =~ "Add member to role"
+    | extend RoleName = tostring(TargetResources[0].displayName)
+    | summarize LastUsed = max(TimeGenerated) by RoleName
+    | where LastUsed < ago(LookbackDays)                    // 30 天未使用
+    | project RoleName
+);
+
+// 2) 检测：特权账号被授予冷门角色
+AuditLogs
+| where TimeGenerated > ago(24h)
+| where OperationNameValue =~ "Add member to role"
+| where ResultType == 0                                      // 成功
+| extend
+    RoleName = tostring(TargetResources[0].displayName),
+    TargetUser = tostring(TargetResources[0].Properties[0].Value),
+    Initiator = tostring(Caller),
+    InitiatorIp = tostring(IpAddress),
+    UserAgent = tostring(UserAgent)
+| where RoleName in~ (SuspiciousRoles)                      // 高危角色
+| join kind=leftouter (
+    ColdRoles | project RoleName, ColdRoleFlag = 1
+) on RoleName
+| extend
+    AlertSeverity = case(
+        ColdRoleFlag == 1 and IsUserSecurityAdmin, "Critical",     // 冷门高危角色
+        ColdRoleFlag == 1, "High",
+        "Medium"
+    ),
+    // 是否在正常工作时间内（UTC+8 → UTC）
+    IsWorkingHours = hourofday(TimeGenerated) >= 1 and hourofday(TimeGenerated) <= 9
+| project
+    Timestamp = TimeGenerated,
+    Initiator,
+    InitiatorIp,
+    TargetUser,
+    RoleName,
+    AlertSeverity,
+    ColdRoleFlag,
+    IsWorkingHours,
+    UserAgent
+| order by Timestamp desc
+```
+
+---
+
+// =============================================================================
+// KQL 检测规则 03：批量设备认证失败（对应真实事故场景）
+// =============================================================================
+// 规则名称    : Mass Device Authentication Failure
+// 规则 ID      : KQL-003
+// 战术        : TA0006 Credential Access
+// 检测逻辑    : 短时间内大量设备出现 Intune / AAD 认证失败（证书过期、CRL 不可达等）
+// 数据源      : SigninLogs + AuditLogs
+// 误报场景    : 大规模发版、Token 刷新峰值
+// 调优建议    : 与设备管理窗口对比；排除已知发版窗口
+// -----------------------------------------------------------------------------
+
+let TimeWindow = 30m;
+let FailureThreshold = 20;                                    // 30 分钟内 20+ 次失败
+let FailureErrorCodes = dynamic([
+    50079,   // MFA required
+    50105,   // User not assigned license
+    7000215, // Invalid client secret
+    700027,  // Client assertion expired
+    700016,  // Application not found (证书链问题常见)
+    7000222, // Expired token
+    50053,   // Account locked out
+    53003,   // Blocked by Conditional Access
+    0        // Generic auth failure
+]);
+
+SigninLogs
+| where TimeGenerated > ago(TimeWindow)
+| where ResultType != 0                                      // 失败
+| extend
+    ResourceApp = tostring(AppDisplayName),
+    IsIntuneRelated = ResourceApp in~ ("Microsoft Intune", "Company Portal", "Microsoft Endpoint Manager"),
+    IsDevice = tobool(IsDeviceAuthenticated),
+    ErrorCode = tostring(ResultType)
+| where ErrorCode in (FailureErrorCodes) or ResultType == 0
+| summarize
+    FailureCount = count(),
+    UniqueDevices = dcount(DeviceId),
+    UniqueUsers = dcount(UserPrincipalName),
+    ErrorBreakdown = make_set(ErrorCode, 10),
+    AffectedApps = make_set(ResourceApp, 10),
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated)
+    by ResultType
+| where FailureCount >= FailureThreshold
+| extend
+    AlertSeverity = case(
+        UniqueDevices >= 50 and IsIntuneRelated, "Critical",    // 大规模设备 + Intune
+        UniqueDevices >= 20, "High",
+        "Medium"
+    ),
+    LikelyCause = case(
+        // 常见根因判断（基于错误码组合）
+        array_has_any(ErrorBreakdown, dynamic(["700016"])), "Certificate Chain / App Registration Issue",
+        array_has_any(ErrorBreakdown, dynamic(["7000222"])), "Expired Token / Certificate",
+        array_has_any(ErrorBreakdown, dynamic(["50079"])),   "MFA Policy Issue",
+        array_has_any(ErrorBreakdown, dynamic(["53003"])),   "Conditional Access Block",
+        "Unknown - Investigate"
+    ),
+    RecommendedAction = case(
+        LikelyCause == "Certificate Chain / App Registration Issue",
+        "Check CRL distribution point reachability and certificate chain validity",
+        LikelyCause == "Expired Token / Certificate",
+        "Verify device certificate renewal status and SCEP endpoints",
+        "Escalate to platform team for investigation"
+    )
+| project
+    Timestamp = EndTime,
+    AlertSeverity,
+    LikelyCause,
+    RecommendedAction,
+    FailureCount,
+    UniqueDevices,
+    UniqueUsers,
+    ErrorCode = ResultType,
+    ErrorBreakdown = tostring(ErrorBreakdown),
+    AffectedApps = tostring(AffectedApps),
+    TimeSpanMinutes = datetime_diff('minute', StartTime, EndTime)
+| order by Timestamp desc
+```
+
+---
+
+// =============================================================================
+// KQL 检测规则 04：数据外泄风险 - 异常批量下载
+// =============================================================================
+// 规则名称    : Data Exfiltration Risk - Mass Download
+// 规则 ID      : KQL-004
+// 战术        : TA0010 Exfiltration
+// 检测逻辑    : 单一账号短时间下载大量敏感文件
+// 数据源      : CloudAppEvents / OfficeActivity
+// 误报场景    : 数据迁移、合规导出、备份任务
+// 调优建议    : 对已知的数据工程账号做白名单
+// -----------------------------------------------------------------------------
+
+OfficeActivity
+| where Operation == "FileSyncDownloaded" or Operation == "FileSyncDownloadedMultiple"
+| where TimeGenerated > ago(2h)
+| extend
+    FileSizeMB = todouble(FileSize) / 1024 / 1024,
+    SensitivityLabel = tostring(SensitivityLabel),
+    UserSensitivity = case(
+        tostring(UserId) has_anyprefix (dynamic(["admin", "svc_"])), "High", "Standard"
+    ),
+    IsSensitive = SensitivityLabel in~ ("Confidential", "Highly Confidential")
+| summarize
+    DownloadCount = count(),
+    TotalSizeMB = sum(FileSizeMB),
+    UniqueFiles = dcount(Name),
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    FileTypes = make_set(FileType, 10),
+    Labels = make_set(SensitivityLabel, 5)
+    by UserId, UserDisplayName, UserSensitivity, IsSensitive
+| where
+    DownloadCount >= 50 or
+    (TotalSizeMB >= 2048) or                                   // 单账号 2GB
+    (IsSensitive and DownloadCount >= 10)
+| extend
+    AlertSeverity = case(
+        UserSensitivity == "High" and IsSensitive and TotalSizeMB >= 2048, "Critical",
+        IsSensitive and TotalSizeMB >= 1024, "High",
+        "Medium"
+    )
+| project
+    Timestamp = EndTime,
+    UserId,
+    UserDisplayName,
+    AlertSeverity,
+    DownloadCount,
+    UniqueFiles,
+    TotalSizeMB = round(TotalSizeMB, 2),
+    FileTypes = tostring(FileTypes),
+    SensitivityLabels = tostring(Labels),
+    DurationMinutes = datetime_diff('minute', StartTime, EndTime)
+| order by Timestamp desc
+```
+
+---
+
+// =============================================================================
+// KQL 检测规则 05：影子 IT - 未授权云服务访问
+// =============================================================================
+// 规则名称    : Shadow IT - Unauthorized Cloud Service Access
+// 规则 ID      : KQL-005
+// 战术        : TA0002 Initial Access
+// 检测逻辑    : 用户访问未在企业 App 许可清单中的云服务
+// 数据源      : CloudAppEvents
+// 误报场景    : 个人账号处理工作（需政策沟通）、新服务未纳管
+// 调优建议    : 建立并维护企业 SaaS 许可清单；新服务需 IT 审批
+// -----------------------------------------------------------------------------
+
+let ApprovedApps = dynamic([
+    "Microsoft 365", "Microsoft Teams", "Microsoft SharePoint",
+    "Microsoft Exchange Online", "Microsoft Azure", "Microsoft Entra ID"
+]);
+
+CloudAppEvents
+| where TimeGenerated > ago(24h)
+| extend
+    ServiceName = split(Application, " - ")[0],           // 提取服务名
+    AppId = tostring(AppId)
+| where ServiceName !in (ApprovedApps)
+| summarize
+    AccessCount = count(),
+    FirstAccess = min(TimeGenerated),
+    LastAccess = max(TimeGenerated),
+    Actions = make_set(ActionType, 10),
+    UserAgent = make_set(UserAgent, 5)
+    by UserId, UserDisplayName, ServiceName, AppId
+| extend
+    AlertSeverity = case(
+        AccessCount >= 100, "High",
+        AccessCount >= 20, "Medium",
+        "Low"
+    ),
+    RecommendedAction = case(
+        ServiceName has_any ("dropbox", "box", "wetransfer", "mega", "icloud"),
+        "Block access - unapproved file sharing service",
+        "Review with IT - is this an approved business tool?"
+    )
+| project
+    Timestamp = LastAccess,
+    UserId,
+    UserDisplayName,
+    ServiceName,
+    AppId,
+    AlertSeverity,
+    AccessCount,
+    Actions = tostring(Actions),
+    RecommendedAction
+| order by AlertSeverity desc, Timestamp desc
+```
+
+---
+
+// =============================================================================
+// KQL 检测规则 06：MFA 疲劳攻击检测
+// =============================================================================
+// 规则名称    : MFA Fatigue / Phishing-resistant Attack
+// 规则 ID      : KQL-006
+// 战术        : TA0006 Credential Access
+// 检测逻辑    : 同一账号短时间内大量 MFA 失败后伴随一次成功（用户在"被轰炸"后妥协）
+// 数据源      : SigninLogs
+// 误报场景    : 密码管理器重复提交、设备时钟漂移导致的重复推送
+// 调优建议    : 关联设备 ID；排除可信设备（已注册 MFA 的设备）
+// -----------------------------------------------------------------------------
+
+let Window = 1h;
+let MfaFailureBurst = 5;                                      // 1 小时内 5+ 次 MFA 失败
+let SuccessAfterFailures = 2;                                 // 至少 2 次失败后成功
+
+SigninLogs
+| where TimeGenerated > ago(Window)
+| extend
+    IsMfaEvent = ResultType in (50079, 50072, 50066, 53003),  // MFA 相关的失败码
+    IsSuccess = ResultType == 0,
+    DeviceId = tostring(DeviceId),
+    Location = strcat(tostring(LocationDetails.countryOrRegion), "/", tostring(LocationDetails.city))
+| where IsMfaEvent or IsSuccess
+| summarize
+    MfaFailures = countif(IsMfaEvent),
+    SuccessCount = countif(IsSuccess),
+    Locations = make_set(Location, 10),
+    Devices = make_set(DeviceId, 10),
+    IpAddresses = make_set(IpAddress, 10),
+    FirstEvent = min(TimeGenerated),
+    LastEvent = max(TimeGenerated)
+    by UserPrincipalName, UserDisplayName
+| where MfaFailures >= MfaFailureBurst and SuccessCount >= 1
+| extend
+    AlertSeverity = case(
+        MfaFailures >= 15, "Critical",
+        MfaFailures >= 10, "High",
+        "Medium"
+    ),
+    IsMfaFatiguePattern = MfaFailures >= MfaFailureBurst and SuccessCount >= SuccessAfterFailures,
+    RecommendedAction = "Force password reset + revoke sessions + verify user identity out-of-band"
+| project
+    Timestamp = LastEvent,
+    UserPrincipalName,
+    UserDisplayName,
+    AlertSeverity,
+    MfaFailures,
+    SuccessCount,
+    Locations = tostring(Locations),
+    Devices = tostring(Devices),
+    SourceIPs = tostring(IpAddresses),
+    RecommendedAction
+| order by AlertSeverity desc, Timestamp desc
+```
